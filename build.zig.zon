@@ -1,0 +1,13 @@
+.{
+    .name = .input_manager,
+    .version = "0.0.1",
+    .dependencies = .{
+        .libxkbcommon = .{
+            .url = "git+https://github.com/allyourcodebase/libxkbcommon.git?ref=1.13.1#8c31126430bec39d2cb5f06aa3c2667e006b32ea",
+            .hash = "libxkbcommon-1.13.1-93LaF2x7AgDgSrr8xjRYrYGhtGhJKcZMuID3M95APvl1",
+        },
+    },
+    .minimum_zig_version = "0.16.0",
+    .paths = .{""},
+    .fingerprint = 0xef32bc791cf5ea56,
+}
