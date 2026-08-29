@@ -248,6 +248,7 @@ const Registry = struct {
 
         const ev_context = try gpa.create(Context);
         errdefer gpa.destroy(ev_context);
+        ev_context = .{ .evdev = null };
         const return_code = c.libevdev_new_from_fd(@intCast(fd), &ev_context.evdev);
         if (return_code < 0) return error.evdevFdFailure;
         errdefer c.libevdev_free(ev_context.evdev);
