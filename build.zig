@@ -26,8 +26,8 @@ pub fn build(b: *std.Build) void {
 
     const exe = b.addExecutable(.{
         .name = "root",
-        .use_llvm = true,
-        .use_lld = true,
+        .use_llvm = b.option(bool, "use_llvm", "Enable to force use of llvm") orelse null,
+        .use_lld = b.option(bool, "use_lld", "Enable to force use of lld") orelse null,
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
@@ -38,6 +38,7 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe);
 
     const run_exe = b.addRunArtifact(exe);
+    const run_step = b.step("run", "Run the test app");
 
-    b.getInstallStep().dependOn(&run_exe.step);
+    run_step.dependOn(&run_exe.step);
 }
