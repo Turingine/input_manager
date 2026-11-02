@@ -9,6 +9,7 @@ pub const c = @cImport({
     @cInclude("libudev.h");
     @cInclude("libevdev-1.0/libevdev/libevdev.h");
     @cInclude("xkbcommon/xkbcommon.h");
+    @cInclude("xkbcommon/xkbcommon-compose.h");
 });
 
 events_registry: Registry,
@@ -16,6 +17,8 @@ epoll_fd: usize,
 xkb_context: ?*c.xkb_context,
 keymap: ?*c.xkb_keymap,
 xkb_state: ?*c.xkb_state,
+compose_table: ?*c.xkb_compose_table,
+compose_state: ?*c.xkb_compose_state,
 udev: ?*c.struct_udev,
 monitor: ?*c.udev_monitor,
 udev_fd: c_int,
@@ -28,21 +31,13 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io) !@This() {
     result.events_registry = .init(result.epoll_fd);
     errdefer result.events_registry.deinit(gpa);
 
-    result.xkb_context = c.xkb_context_new(c.XKB_CONTEXT_NO_FLAGS);
-    if (result.xkb_context == null) return error.XkbContextInitFailed;
-    errdefer c.xkb_context_unref(result.xkb_context);
-
-    const rule_names: c.xkb_rule_names = .{
-        .model = "pc105",
-        .layout = "us",
-    };
-    result.keymap = c.xkb_keymap_new_from_names2(result.xkb_context, &rule_names, c.XKB_KEYMAP_FORMAT_TEXT_V1, c.XKB_KEYMAP_COMPILE_NO_FLAGS);
-    if (result.keymap == null) return error.XkbKeymapInitFailed;
-    errdefer c.xkb_keymap_unref(result.keymap);
-
-    result.xkb_state = c.xkb_state_new(result.keymap);
-    if (result.xkb_state == null) return error.XkbStateInitFailed;
-    errdefer c.xkb_state_unref(result.xkb_state);
+    // The calculator keyboard (keyboardd) emits AZERTY positions: decoding them
+    // with "us" gave `sin5)-` for `sin(0)`
+    // (docs/apps/calculator-problemes-zig.md, section 6).
+    var layout = try SystemLayout.read(gpa, io);
+    defer layout.deinit(gpa);
+    try result.initXkb(&layout.ruleNames(), composeLocale());
+    errdefer result.deinitXkb();
 
     // Evdev
     {
@@ -62,6 +57,10 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io) !@This() {
 
             result.events_registry.registerDevice(gpa, @ptrCast(path)) catch |err| switch (err) {
                 error.evdevFdFailure => continue,
+                error.OpenError => {
+                    std.log.err("Failed to open event file: {s}", .{ path });
+                    continue;
+                },
                 else => return err,
             };
         }
@@ -98,15 +97,154 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io) !@This() {
 pub fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
     defer self.events_registry.deinit(gpa);
 
-    defer c.xkb_context_unref(self.xkb_context);
-    defer c.xkb_keymap_unref(self.keymap);
-    defer c.xkb_state_unref(self.xkb_state);
+    defer self.deinitXkb();
 
     defer _ = c.udev_unref(self.udev);
     defer _ = c.udev_monitor_unref(self.monitor);
     defer gpa.destroy(self.udev_event);
     defer gpa.destroy(@as(*Context, @ptrFromInt(self.udev_event.data.ptr)));
 }
+
+/// XKB part of init: context, keymap, state and compose table. Separate from
+/// init so that the tests can build it without /dev/input.
+fn initXkb(self: *@This(), rule_names: *const c.xkb_rule_names, locale: [*:0]const u8) !void {
+    self.xkb_context = c.xkb_context_new(c.XKB_CONTEXT_NO_FLAGS);
+    if (self.xkb_context == null) return error.XkbContextInitFailed;
+    errdefer c.xkb_context_unref(self.xkb_context);
+
+    self.keymap = c.xkb_keymap_new_from_names2(self.xkb_context, rule_names, c.XKB_KEYMAP_FORMAT_TEXT_V1, c.XKB_KEYMAP_COMPILE_NO_FLAGS);
+    if (self.keymap == null) return error.XkbKeymapInitFailed;
+    errdefer c.xkb_keymap_unref(self.keymap);
+    std.log.info("Layout: {s}", .{ c.xkb_keymap_layout_get_name(self.keymap, 0) });
+
+    self.xkb_state = c.xkb_state_new(self.keymap);
+    if (self.xkb_state == null) return error.XkbStateInitFailed;
+    errdefer c.xkb_state_unref(self.xkb_state);
+
+    // Dead keys: keyboardd types x² as on a real AZERTY keyboard, dead ^ then
+    // Space, and a dead key alone has no text. Without a compose table they
+    // produce nothing, which is a degraded mode, not a reason to fail.
+    self.compose_state = null;
+    self.compose_table = c.xkb_compose_table_new_from_locale(self.xkb_context, locale, c.XKB_COMPOSE_COMPILE_NO_FLAGS);
+    if (self.compose_table == null) {
+        std.log.warn("No compose table for locale {s}: dead keys will produce nothing", .{locale});
+        return;
+    }
+    self.compose_state = c.xkb_compose_state_new(self.compose_table, c.XKB_COMPOSE_STATE_NO_FLAGS);
+    if (self.compose_state == null) {
+        std.log.warn("Compose state creation failed: dead keys will produce nothing", .{});
+        c.xkb_compose_table_unref(self.compose_table);
+        self.compose_table = null;
+    }
+}
+
+// The *_unref functions accept null, hence no check for the compose part.
+fn deinitXkb(self: *@This()) void {
+    defer c.xkb_context_unref(self.xkb_context);
+    defer c.xkb_keymap_unref(self.keymap);
+    defer c.xkb_state_unref(self.xkb_state);
+    defer c.xkb_compose_table_unref(self.compose_table);
+    defer c.xkb_compose_state_unref(self.compose_state);
+}
+
+/// Locale of the compose table, looked up as setlocale(LC_CTYPE, "") would.
+/// libxkbcommon falls back to en_US.UTF-8 for C and POSIX.
+fn composeLocale() [*:0]const u8 {
+    for ([_][*:0]const u8{ "LC_ALL", "LC_CTYPE", "LANG" }) |name| {
+        if (std.c.getenv(name)) |value| {
+            if (value[0] != 0) return value;
+        }
+    }
+    return "C";
+}
+
+/// Keyboard layout of the system, read from /etc/default/keyboard as
+/// keyboardd and core/input/evdev_input do. A field left empty falls back to
+/// XKB_DEFAULT_* or to the libxkbcommon default (pc105, us).
+const SystemLayout = struct {
+    model: [:0]const u8 = "",
+    layout: [:0]const u8 = "",
+    variant: [:0]const u8 = "",
+    options: [:0]const u8 = "",
+
+    const path = "/etc/default/keyboard";
+
+    fn read(gpa: std.mem.Allocator, io: std.Io) !SystemLayout {
+        const text = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64 * 1024)) catch |err| {
+            std.log.warn("{s} unreadable ({s}): default XKB layout", .{ path, @errorName(err) });
+            var result: SystemLayout = .{};
+            try result.addNumpadMac(gpa);
+            return result;
+        };
+        defer gpa.free(text);
+        return parse(gpa, text);
+    }
+
+    /// Shell syntax, KEY="value" per line. The fields are copies: the result
+    /// does not borrow from text.
+    fn parse(gpa: std.mem.Allocator, text: []const u8) !SystemLayout {
+        var result: SystemLayout = .{};
+        errdefer result.deinit(gpa);
+
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        while (lines.next()) |raw_line| {
+            const line = std.mem.trim(u8, raw_line, " \t\r");
+            if (line.len == 0 or line[0] == '#') continue;
+            const equal = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+            const key = line[0..equal];
+            const field = if (std.mem.eql(u8, key, "XKBMODEL"))
+                &result.model
+            else if (std.mem.eql(u8, key, "XKBLAYOUT"))
+                &result.layout
+            else if (std.mem.eql(u8, key, "XKBVARIANT"))
+                &result.variant
+            else if (std.mem.eql(u8, key, "XKBOPTIONS"))
+                &result.options
+            else
+                continue;
+            const value = std.mem.trim(u8, line[equal + 1 ..], "\"'");
+            // An empty value keeps the "" literal: only non-empty fields are
+            // allocated, which is what deinit relies on.
+            const copy: [:0]const u8 = if (value.len == 0) "" else try gpa.dupeZ(u8, value);
+            if (field.len != 0) gpa.free(field.*);
+            field.* = copy;
+        }
+        try result.addNumpadMac(gpa);
+        return result;
+    }
+
+    /// Keypad digits whatever Num Lock says. keyboardd sends the calculator
+    /// digits as KEY_KP*, which XKB turns into KP_End & co. without Num Lock,
+    /// and Num Lock state is per application: this option is the fix that
+    /// docs/services/keyboard.md recommends. A numpad option already set by
+    /// the system is kept.
+    fn addNumpadMac(self: *SystemLayout, gpa: std.mem.Allocator) !void {
+        if (std.mem.indexOf(u8, self.options, "numpad:") != null) return;
+        const options = if (self.options.len == 0)
+            try gpa.dupeZ(u8, "numpad:mac")
+        else
+            try std.mem.concatWithSentinel(gpa, u8, &.{ self.options, ",numpad:mac" }, 0);
+        if (self.options.len != 0) gpa.free(self.options);
+        self.options = options;
+    }
+
+    /// Borrows from self, which must outlive the keymap compilation.
+    fn ruleNames(self: *const SystemLayout) c.xkb_rule_names {
+        return .{
+            .model = self.model.ptr,
+            .layout = self.layout.ptr,
+            .variant = self.variant.ptr,
+            .options = self.options.ptr,
+        };
+    }
+
+    fn deinit(self: *SystemLayout, gpa: std.mem.Allocator) void {
+        for ([_][:0]const u8{ self.model, self.layout, self.variant, self.options }) |field| {
+            if (field.len != 0) gpa.free(field);
+        }
+        self.* = .{};
+    }
+};
 
 pub const KeyType = c.xkb_keysym_t;
 
@@ -164,32 +302,9 @@ pub fn poll(self: *@This(), gpa: std.mem.Allocator, accumulator: *std.ArrayList(
                     switch (c.libevdev_next_event(ev_device, flag, &ev_event)) {
                         c.LIBEVDEV_READ_STATUS_SUCCESS => {
                             if (ev_event.type != c.EV_KEY) continue;
-                            const keycode = ev_event.code + 8;
-
-                            const KeyValues = struct {
-                                const KEY_UP = 0;
-                                const KEY_DOWN = 1;
-                                const KEY_REPEAT = 2;
-                            };
-
-                            switch (ev_event.value) {
-                                KeyValues.KEY_UP => _ = c.xkb_state_update_key(self.xkb_state, keycode, c.XKB_KEY_UP),
-                                KeyValues.KEY_DOWN => {
-                                    _ = c.xkb_state_update_key(self.xkb_state, keycode, c.XKB_KEY_DOWN);
-                                    continue;
-                                },
-                                KeyValues.KEY_REPEAT => {
-                                    if (c.xkb_key_repeats(self.keymap, keycode) == 0) continue;
-                                },
-                                else => {
-                                    std.debug.print("Unhandled EV event value: {d}\n", .{ ev_event.value });
-                                    return error.UnhandledEVValue;
-                                },
+                            if (try self.handleKey(ev_event.code, ev_event.value)) |keysym| {
+                                try accumulator.append(gpa, keysym);
                             }
-
-                            const keysym = c.xkb_state_key_get_one_sym(self.xkb_state, keycode);
-
-                            try accumulator.append(gpa, keysym);
                         },
                         c.LIBEVDEV_READ_STATUS_SYNC => flag = c.LIBEVDEV_READ_FLAG_SYNC,
                         -c.EAGAIN => {
@@ -207,6 +322,68 @@ pub fn poll(self: *@This(), gpa: std.mem.Allocator, accumulator: *std.ArrayList(
                 }
             }
         }
+    }
+}
+
+/// Feeds one evdev key event to XKB and returns the keysym it types, if any.
+/// A key types when pressed and when repeated, as on any keyboard; it used to
+/// type when released, which delayed every character and made Shift released
+/// a little early change the result. The keysym is read before the state
+/// update, as in the xkbcommon quick guide.
+fn handleKey(self: *@This(), code: u16, value: i32) !?KeyType {
+    const keycode = @as(c.xkb_keycode_t, code) + 8; // evdev to XKB numbering
+
+    const KeyValues = struct {
+        const KEY_UP = 0;
+        const KEY_DOWN = 1;
+        const KEY_REPEAT = 2;
+    };
+
+    const keysym = switch (value) {
+        KeyValues.KEY_UP => {
+            _ = c.xkb_state_update_key(self.xkb_state, keycode, c.XKB_KEY_UP);
+            return null;
+        },
+        KeyValues.KEY_DOWN => blk: {
+            const keysym = c.xkb_state_key_get_one_sym(self.xkb_state, keycode);
+            _ = c.xkb_state_update_key(self.xkb_state, keycode, c.XKB_KEY_DOWN);
+            break :blk keysym;
+        },
+        KeyValues.KEY_REPEAT => blk: {
+            if (c.xkb_key_repeats(self.keymap, keycode) == 0) return null;
+            break :blk c.xkb_state_key_get_one_sym(self.xkb_state, keycode);
+        },
+        else => {
+            std.debug.print("Unhandled EV event value: {d}\n", .{value});
+            return error.UnhandledEVValue;
+        },
+    };
+    // Mouse buttons are EV_KEY too, and map to no keysym.
+    if (keysym == c.XKB_KEY_NoSymbol) return null;
+    return self.compose(keysym);
+}
+
+/// Runs a keysym through the compose table: the same keysym outside of a
+/// sequence, the composed one at its end (dead ^ then e gives ê), and null
+/// while a sequence is pending or once it is cancelled, the keysym that
+/// cancels it included, as libxkbcommon recommends.
+fn compose(self: *@This(), keysym: KeyType) ?KeyType {
+    const state = self.compose_state orelse return keysym;
+    // Modifiers are ignored by the table, and must not break a sequence.
+    if (c.xkb_compose_state_feed(state, keysym) == c.XKB_COMPOSE_FEED_IGNORED) return keysym;
+    switch (c.xkb_compose_state_get_status(state)) {
+        c.XKB_COMPOSE_COMPOSING => return null,
+        c.XKB_COMPOSE_COMPOSED => {
+            const composed = c.xkb_compose_state_get_one_sym(state);
+            c.xkb_compose_state_reset(state);
+            // A sequence can produce a string with no single keysym.
+            return if (composed == c.XKB_KEY_NoSymbol) null else composed;
+        },
+        c.XKB_COMPOSE_CANCELLED => {
+            c.xkb_compose_state_reset(state);
+            return null;
+        },
+        else => return keysym,
     }
 }
 
@@ -244,6 +421,7 @@ const Registry = struct {
             .ACCMODE = .RDONLY,
             .NONBLOCK = true,
         }, 0);
+        if (@as(isize, @bitCast(fd)) < 0) return error.OpenError;
         errdefer _ = linux.close(@intCast(fd));
 
         const ev_context = try gpa.create(Context);
@@ -281,14 +459,19 @@ const Registry = struct {
     }
 };
 
+/// Text of a keysym. The length leaves out the terminating NUL, which
+/// xkb_keysym_to_utf8 counts: it used to end up in the text. Control
+/// characters (Return, BackSpace, Tab, Escape, Delete) are not text either: an
+/// app handles them by keysym, and inserting them put an invisible DEL in the
+/// input (docs/apps/calculator-problemes-zig.md, test J9).
 pub fn getKeyText(key: KeyType) !struct { [5]u8, usize } {
     var buffer: [5]u8 = undefined;
     const size = c.xkb_keysym_to_utf8(key, &buffer, buffer.len);
-    return switch (size) {
-        -1 => error.BufferTooSmall,
-        0 => error.NoUTF8Representation,
-        else => .{ buffer, @intCast(size) },
-    };
+    if (size == -1) return error.BufferTooSmall;
+    if (size == 0) return error.NoUTF8Representation;
+    const len: usize = @intCast(size - 1);
+    if (len == 1 and (buffer[0] < 0x20 or buffer[0] == 0x7f)) return error.ControlCharacter;
+    return .{ buffer, len };
 }
 
 pub fn main(base: std.process.Init) !void {
@@ -338,3 +521,114 @@ const KEYS_TYPE = blk: {
 };
 
 pub const KEYS: KEYS_TYPE = .{};
+
+test "SystemLayout: /etc/default/keyboard of the calculator" {
+    const gpa = std.testing.allocator;
+    var layout = try SystemLayout.parse(gpa,
+        \\# KEYBOARD CONFIGURATION FILE
+        \\
+        \\XKBMODEL="pc105"
+        \\XKBLAYOUT="fr"
+        \\XKBVARIANT=""
+        \\XKBOPTIONS=""
+        \\
+        \\BACKSPACE="guess"
+        \\
+    );
+    defer layout.deinit(gpa);
+    try std.testing.expectEqualStrings("pc105", layout.model);
+    try std.testing.expectEqualStrings("fr", layout.layout);
+    try std.testing.expectEqualStrings("", layout.variant);
+    try std.testing.expectEqualStrings("numpad:mac", layout.options);
+}
+
+test "SystemLayout: options of the system are kept" {
+    const gpa = std.testing.allocator;
+    {
+        var layout = try SystemLayout.parse(gpa, "XKBLAYOUT=fr\nXKBOPTIONS=\"grp:alt_shift_toggle\"\n");
+        defer layout.deinit(gpa);
+        try std.testing.expectEqualStrings("grp:alt_shift_toggle,numpad:mac", layout.options);
+    }
+    {
+        // An explicit numpad option wins, and the last line of a key too.
+        var layout = try SystemLayout.parse(gpa, "XKBOPTIONS=\"numpad:microsoft\"\nXKBLAYOUT=\"us\"\nXKBLAYOUT=\"fr\"");
+        defer layout.deinit(gpa);
+        try std.testing.expectEqualStrings("numpad:microsoft", layout.options);
+        try std.testing.expectEqualStrings("fr", layout.layout);
+    }
+}
+
+test "Calculator keyboard: AZERTY, keypad, AltGr, dead keys" {
+    var im = try testKeyboard();
+    defer im.deinitXkb();
+
+    // AZERTY positions, as keyboardd types sin(0).
+    try expectText("s", try im.tap(c.KEY_S));
+    try expectText("a", try im.tap(c.KEY_Q));
+    try expectText("(", try im.tap(c.KEY_5));
+    try expectText("é", try im.tap(c.KEY_2));
+    _ = try im.handleKey(c.KEY_LEFTSHIFT, 1);
+    try expectText("2", try im.tap(c.KEY_2));
+    _ = try im.handleKey(c.KEY_LEFTSHIFT, 0);
+    try expectText("é", try im.tap(c.KEY_2));
+
+    // Keypad digits without Num Lock, and EXE.
+    try expectText("1", try im.tap(c.KEY_KP1));
+    try expectText("+", try im.tap(c.KEY_KPPLUS));
+    try std.testing.expectEqual(@as(?KeyType, c.XKB_KEY_KP_Enter), try im.tap(c.KEY_KPENTER));
+
+    // AltGr, the right Alt.
+    _ = try im.handleKey(c.KEY_RIGHTALT, 1);
+    try expectText("@", try im.tap(c.KEY_0));
+    try expectText("€", try im.tap(c.KEY_E));
+    _ = try im.handleKey(c.KEY_RIGHTALT, 0);
+    try expectText("à", try im.tap(c.KEY_0));
+
+    // Dead keys: keyboardd types x² as dead ^ then Space.
+    try std.testing.expectEqual(@as(?KeyType, null), try im.tap(c.KEY_LEFTBRACE));
+    try expectText("^", try im.tap(c.KEY_SPACE));
+    try std.testing.expectEqual(@as(?KeyType, null), try im.tap(c.KEY_LEFTBRACE));
+    try expectText("ê", try im.tap(c.KEY_E));
+}
+
+test "A key types when pressed and repeated, not when released" {
+    var im = try testKeyboard();
+    defer im.deinitXkb();
+
+    try expectText("z", try im.handleKey(c.KEY_W, 1));
+    try expectText("z", try im.handleKey(c.KEY_W, 2));
+    try std.testing.expectEqual(@as(?KeyType, null), try im.handleKey(c.KEY_W, 0));
+    // A mouse button is an EV_KEY with no keysym.
+    try std.testing.expectEqual(@as(?KeyType, null), try im.handleKey(c.BTN_LEFT, 1));
+    _ = try im.handleKey(c.BTN_LEFT, 0);
+}
+
+test "getKeyText: no NUL, no control character" {
+    const text = try getKeyText(c.XKB_KEY_eacute);
+    try std.testing.expectEqualStrings("é", text.@"0"[0..text.@"1"]);
+    try std.testing.expectError(error.ControlCharacter, getKeyText(c.XKB_KEY_BackSpace));
+    try std.testing.expectError(error.ControlCharacter, getKeyText(c.XKB_KEY_Delete));
+    try std.testing.expectError(error.ControlCharacter, getKeyText(c.XKB_KEY_Return));
+    try std.testing.expectError(error.NoUTF8Representation, getKeyText(c.XKB_KEY_F1));
+}
+
+/// The XKB part alone, set up as on the calculator: fr, keypad option, compose
+/// table of the C locale (en_US.UTF-8).
+fn testKeyboard() !@This() {
+    var im: @This() = undefined;
+    const names: c.xkb_rule_names = .{ .model = "pc105", .layout = "fr", .variant = "", .options = "numpad:mac" };
+    try im.initXkb(&names, "C");
+    return im;
+}
+
+/// Press then release, as keyboardd types: what the key typed, if anything.
+fn tap(self: *@This(), code: u16) !?KeyType {
+    const keysym = try self.handleKey(code, 1);
+    _ = try self.handleKey(code, 0);
+    return keysym;
+}
+
+fn expectText(expected: []const u8, keysym: ?KeyType) !void {
+    const text = try getKeyText(keysym orelse return error.TestExpectedKeysym);
+    try std.testing.expectEqualStrings(expected, text.@"0"[0..text.@"1"]);
+}
