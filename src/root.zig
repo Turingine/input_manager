@@ -459,19 +459,38 @@ const Registry = struct {
     }
 };
 
+const UTF8Char = struct {
+    data: [5]u8,
+    // The real amount of bytes of data occupied by the unicode codepoint, not accounting for the null terminator
+    bytes_occupied: usize,
+
+    // Be careful with lifetime, the returned string only lives as long as the provided struct
+    pub fn slice(self: UTF8Char) []const u8 {
+        return self.data[0..self.bytes_occupied];
+    }
+};
+
 /// Text of a keysym. The length leaves out the terminating NUL, which
 /// xkb_keysym_to_utf8 counts: it used to end up in the text. Control
 /// characters (Return, BackSpace, Tab, Escape, Delete) are not text either: an
 /// app handles them by keysym, and inserting them put an invisible DEL in the
 /// input (docs/apps/calculator-problemes-zig.md, test J9).
-pub fn getKeyText(key: KeyType) !struct { [5]u8, usize } {
+pub fn getKeyText(key: KeyType) !UTF8Char {
     var buffer: [5]u8 = undefined;
     const size = c.xkb_keysym_to_utf8(key, &buffer, buffer.len);
-    if (size == -1) return error.BufferTooSmall;
-    if (size == 0) return error.NoUTF8Representation;
-    const len: usize = @intCast(size - 1);
-    if (len == 1 and (buffer[0] < 0x20 or buffer[0] == 0x7f)) return error.ControlCharacter;
-    return .{ buffer, len };
+
+    switch (size) {
+        -1 => return error.BufferTooSmall,
+        0 => return error.NoUTF8Representation,
+        else => {
+            const len: usize = @intCast(size - 1);
+            if (len == 1 and (buffer[0] < 0x20 or buffer[0] == 0x7f)) return error.ControlCharacter;
+            return .{ 
+                .data = buffer,
+                .bytes_occupied = len,
+            };
+        }
+    }
 }
 
 pub fn main(base: std.process.Init) !void {
